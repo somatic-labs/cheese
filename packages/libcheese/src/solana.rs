@@ -85,32 +85,26 @@ impl TradeExecutor {
         amount_in: u64,
     ) -> Result<Signature> {
         // 1. Get quote from Meteora
-        let quote = meteora::get_meteora_quote(
-            &self.http_client,
-            &pool.pool_address,
-            input_mint,
-            output_mint,
-            amount_in,
-        )
-        .await?;
+        let quote =
+            meteora::get_meteora_quote(&self.http_client, pool, input_mint, output_mint, amount_in)
+                .await?;
 
         println!(
             "Got quote: {} -> {} ({} -> {})",
             input_mint, output_mint, quote.in_amount, quote.out_amount
         );
 
-        // 2. Get swap transaction
-        let swap_tx = meteora::get_meteora_swap_transaction(
+        // 2. Build swap transaction
+        let tx = meteora::get_meteora_swap_transaction(
             &self.http_client,
             &quote,
             &self.wallet.pubkey().to_string(),
+            &self.rpc_client,
+            &self.wallet,
         )
         .await?;
 
-        // 3. Deserialize and sign transaction
-        let tx: Transaction = bincode::deserialize(&base64::decode(swap_tx)?)?;
-
-        // 4. Simulate transaction with detailed error reporting
+        // 3. Simulate transaction with detailed error reporting
         match self.simulate_transaction(&tx).await {
             Ok(_) => println!("Transaction simulation successful"),
             Err(e) => {
@@ -119,7 +113,7 @@ impl TradeExecutor {
             }
         }
 
-        // 5. Send and confirm transaction
+        // 4. Send and confirm transaction
         self.send_and_confirm_transaction(&tx).await
     }
 
@@ -166,6 +160,31 @@ impl TradeExecutor {
             .send_and_confirm_transaction(transaction)
             .map_err(|e| anyhow!("Failed to send transaction: {}", e))?;
         Ok(signature)
+    }
+
+    /// Ensure a token account exists for the given mint, create if it doesn't
+    pub async fn ensure_token_account(&self, mint: &str) -> Result<()> {
+        let token_account = self.find_token_account(mint)?;
+        if self.rpc_client.get_account(&token_account).is_err() {
+            println!("Creating token account for mint: {}", mint);
+            // Create ATA instruction
+            let create_ata_ix = spl_associated_token_account::create_associated_token_account(
+                &self.wallet.pubkey(),
+                &self.wallet.pubkey(),
+                &Pubkey::from_str(mint)?,
+            );
+            // Build and send transaction
+            let recent_blockhash = self.rpc_client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &[create_ata_ix],
+                Some(&self.wallet.pubkey()),
+                &[&self.wallet],
+                recent_blockhash,
+            );
+            self.rpc_client.send_and_confirm_transaction(&tx)?;
+            println!("Created token account for mint: {}", mint);
+        }
+        Ok(())
     }
 }
 

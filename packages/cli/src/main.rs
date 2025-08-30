@@ -364,6 +364,16 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             .iter()
             .find(|p| p.pool_address == opp.pool_address)
             .unwrap();
+
+        // Skip derived pools
+        if pool.derived {
+            println!(
+                "\nSkipping derived pool: {} ({})",
+                pool.pool_address, opp.symbol
+            );
+            continue;
+        }
+
         let fee_percent = pool
             .total_fee_pct
             .trim_end_matches('%')
@@ -414,7 +424,15 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
         // Execute trade if in hot mode
         if let Some(executor) = executor {
-            println!("\nExecuting trade...");
+            println!("\n=== Starting Trade Execution ===");
+            println!("Trade details:");
+            println!("- Is sell: {}", opp.is_sell);
+            println!("- Max trade size: {}", opp.max_trade_size);
+            println!("- USDC price: {}", opp.usdc_price);
+            println!("- Implied price: {}", opp.implied_price);
+            println!("- Net profit USD: {}", opp.net_profit_usd);
+            println!("- Pool address: {}", opp.pool_address);
+            println!("- Symbol: {}", opp.symbol);
 
             // Get the other token's index
             let (_, other_ix) = if pool.pool_token_mints[0] == CHEESE_MINT {
@@ -422,12 +440,26 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             } else {
                 (1, 0)
             };
+            println!("\nPool details:");
+            println!("- Pool token mints: {:?}", pool.pool_token_mints);
+            println!("- Pool token amounts: {:?}", pool.pool_token_amounts);
+            println!("- Other token index: {}", other_ix);
+
+            // Ensure all necessary token accounts exist before trading
+            println!("\nEnsuring token accounts exist...");
+            executor.ensure_token_account(USDC_MINT).await?;
+            executor.ensure_token_account(CHEESE_MINT).await?;
+            executor
+                .ensure_token_account(&pool.pool_token_mints[other_ix])
+                .await?;
 
             if opp.is_sell {
-                // Path: USDC -> CHEESE -> Target -> CHEESE -> USDC
+                println!("\nExecuting sell path: USDC -> CHEESE -> Target -> CHEESE -> USDC");
 
                 // 1. USDC -> CHEESE on Meteora
                 let amount_in_usdc = (opp.max_trade_size * opp.usdc_price * 1_000_000.0) as u64;
+                println!("\nStep 1: USDC -> CHEESE");
+                println!("Amount in USDC: {}", amount_in_usdc);
                 let sig1 = executor
                     .execute_trade(
                         usdc_pool,
@@ -441,6 +473,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 2. CHEESE -> Target token
                 let amount_in_cheese = (opp.max_trade_size * 1_000_000_000.0) as u64;
+                println!("\nStep 2: CHEESE -> {}", opp.symbol);
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig2 = executor
                     .execute_trade(
                         pool,
@@ -454,6 +488,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 3. Target -> CHEESE
                 let amount_in_target = (opp.other_qty * 0.1 * 1_000_000_000.0) as u64; // 10% of target token liquidity
+                println!("\nStep 3: {} -> CHEESE", opp.symbol);
+                println!("Amount in {}: {}", opp.symbol, amount_in_target);
                 let sig3 = executor
                     .execute_trade(
                         pool,
@@ -466,15 +502,19 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
                 println!("3. {} -> CHEESE: {}", opp.symbol, sig3);
 
                 // 4. CHEESE -> USDC
+                println!("\nStep 4: CHEESE -> USDC");
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig4 = executor
                     .execute_trade(usdc_pool, CHEESE_MINT, USDC_MINT, amount_in_cheese, 50)
                     .await?;
                 println!("4. CHEESE -> USDC: {}", sig4);
             } else {
-                // Path: USDC -> CHEESE -> Target -> CHEESE -> USDC
+                println!("\nExecuting buy path: USDC -> CHEESE -> Target -> CHEESE -> USDC");
 
                 // 1. USDC -> CHEESE on Meteora
                 let amount_in_usdc = (opp.max_trade_size * opp.usdc_price * 1_000_000.0) as u64;
+                println!("\nStep 1: USDC -> CHEESE");
+                println!("Amount in USDC: {}", amount_in_usdc);
                 let sig1 = executor
                     .execute_trade(usdc_pool, USDC_MINT, CHEESE_MINT, amount_in_usdc, 50)
                     .await?;
@@ -482,6 +522,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 2. CHEESE -> Target token
                 let amount_in_cheese = (opp.max_trade_size * 1_000_000_000.0) as u64;
+                println!("\nStep 2: CHEESE -> {}", opp.symbol);
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig2 = executor
                     .execute_trade(
                         pool,
@@ -495,6 +537,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 3. Target -> CHEESE
                 let amount_in_target = (opp.other_qty * 0.1 * 1_000_000_000.0) as u64; // 10% of target token liquidity
+                println!("\nStep 3: {} -> CHEESE", opp.symbol);
+                println!("Amount in {}: {}", opp.symbol, amount_in_target);
                 let sig3 = executor
                     .execute_trade(
                         pool,
@@ -507,6 +551,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
                 println!("3. {} -> CHEESE: {}", opp.symbol, sig3);
 
                 // 4. CHEESE -> USDC
+                println!("\nStep 4: CHEESE -> USDC");
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig4 = executor
                     .execute_trade(usdc_pool, CHEESE_MINT, USDC_MINT, amount_in_cheese, 50)
                     .await?;
