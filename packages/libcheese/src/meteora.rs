@@ -102,6 +102,7 @@ pub async fn get_meteora_quote(
     amount_in: u64,
 ) -> Result<MeteoraQuoteResponse> {
     // Get current pool state
+    println!("Fetching pool state for {}", pool_address);
     let pool = fetch_pool_state(client, pool_address).await?;
 
     // Find the indices for input and output tokens
@@ -110,6 +111,11 @@ pub async fn get_meteora_quote(
     } else {
         (1, 0)
     };
+
+    println!(
+        "Pool state: in_idx={}, out_idx={}, amounts={:?}",
+        in_idx, out_idx, pool.pool_token_amounts
+    );
 
     // Parse pool amounts
     let in_amount_pool: f64 = pool.pool_token_amounts[in_idx].parse()?;
@@ -129,7 +135,7 @@ pub async fn get_meteora_quote(
     let price_after = (out_amount_pool - amount_out) / (in_amount_pool + amount_in as f64);
     let price_impact = ((price_before - price_after) / price_before * 100.0).to_string();
 
-    Ok(MeteoraQuoteResponse {
+    let quote = MeteoraQuoteResponse {
         pool_address: pool_address.to_string(),
         input_mint: input_mint.to_string(),
         output_mint: output_mint.to_string(),
@@ -137,7 +143,10 @@ pub async fn get_meteora_quote(
         out_amount: amount_out.to_string(),
         fee_amount: fee_amount.to_string(),
         price_impact,
-    })
+    };
+
+    println!("Generated quote: {:?}", quote);
+    Ok(quote)
 }
 
 async fn fetch_pool_state(client: &Client, pool_address: &str) -> Result<MeteoraPool> {
@@ -174,16 +183,25 @@ pub async fn get_meteora_swap_transaction(
         quote_response: quote.clone(),
     };
 
-    // Log the swap request
-    println!("Sending Meteora swap request: {:?}", swap_request);
+    println!("Sending swap request to {}: {:?}", swap_url, swap_request);
 
     let resp = client.post(&swap_url).json(&swap_request).send().await?;
 
     if !resp.status().is_success() {
-        return Err(anyhow!("Meteora swap request failed: {}", resp.status()));
+        let status = resp.status();
+        let error_text = resp.text().await?;
+        return Err(anyhow!(
+            "Meteora swap request failed: {} - {}",
+            status,
+            error_text
+        ));
     }
 
     let swap: MeteoraSwapResponse = resp.json().await?;
+    println!(
+        "Received swap transaction (length={})",
+        swap.transaction.len()
+    );
     Ok(swap.transaction)
 }
 

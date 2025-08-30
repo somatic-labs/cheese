@@ -2128,6 +2128,7 @@ dependencies = [
  "solana-client",
  "solana-sdk",
  "spl-associated-token-account",
+ "spl-token 4.0.2",
  "tokio",
 ]
 
@@ -4979,6 +4980,21 @@ dependencies = [
  "spl-pod 0.5.0",
  "spl-program-error 0.6.0",
  "spl-type-length-value 0.7.0",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "spl-token"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e9e171cbcb4b1f72f6d78ed1e975cb467f56825c27d09b8dd2608e4e7fc8b3b"
+dependencies = [
+ "arrayref",
+ "bytemuck",
+ "num-derive",
+ "num-traits",
+ "num_enum",
+ "solana-program",
  "thiserror 1.0.69",
 ]
 
