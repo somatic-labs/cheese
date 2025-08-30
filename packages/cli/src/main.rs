@@ -1,25 +1,22 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
-use libcheese::common::{parse_other_token_name, CHEESE_MINT};
+use libcheese::common::USDC_MINT;
+use libcheese::common::{is_blacklisted, parse_other_token_name, CHEESE_MINT};
 use libcheese::jupiter::fetch_jupiter_prices;
 use libcheese::meteora::{fetch_meteora_cheese_pools, MeteoraPool};
 use libcheese::raydium::{fetch_raydium_cheese_pools, fetch_raydium_mint_ids};
 use libcheese::solana::TradeExecutor;
 use reqwest::Client;
-use solana_sdk::signature::Keypair;
 use solana_sdk::signer::keypair::read_keypair_file;
+use solana_sdk::signer::Signer;
 use std::collections::{HashMap, HashSet};
-use std::env;
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::time;
 
-const WALLET_CHEESE_BALANCE: f64 = 5_000_000.0;
-const WALLET_SOL_BALANCE: f64 = 1.0;
 const SOL_PER_TX: f64 = 0.000005; // Approximate SOL cost per transaction
-const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const LOOP_INTERVAL: Duration = Duration::from_secs(30);
 const MIN_PROFIT_USD: f64 = 1.0; // Minimum profit in USD to execute trade
+const MAX_USDC_INPUT: f64 = 10.0; // Maximum USDC input for any trade
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,12 +41,12 @@ struct DisplayPool {
     other_symbol: String,
     cheese_qty: String,
     other_qty: String,
-    pool_type: String,
+    pool_version: String,
     tvl: String,
     volume_usd: String,
     fee: String,
     pool_address: String,
-    cheese_price: String, // e.g. "$0.000057"
+    cheese_price: String,
 }
 
 #[derive(Debug, Default)]
@@ -121,13 +118,43 @@ async fn main() -> Result<()> {
 
         let keypair_path = args.keypair.unwrap();
         let keypair = read_keypair_file(&keypair_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read keypair file: {}", e))?;
+            .map_err(|e| anyhow!("Failed to read keypair file: {}", e))?;
+
+        println!("\n=== Wallet Information ===");
+        println!("Address: {}", keypair.pubkey());
 
         let rpc_url = args
             .rpc_url
             .unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_string());
 
-        Some(TradeExecutor::new(&rpc_url, keypair))
+        let executor = TradeExecutor::new(&rpc_url, keypair);
+
+        // Get and display SOL balance
+        let sol_balance = executor
+            .rpc_client
+            .get_balance(&executor.wallet.pubkey())
+            .map_err(|e| anyhow!("Failed to get SOL balance: {}", e))?;
+        println!("SOL balance: {} SOL", sol_balance as f64 / 1_000_000_000.0);
+
+        // Get and display USDC balance
+        let usdc_balance = match executor.get_token_balance(&USDC_MINT.parse()?).await {
+            Ok(balance) => balance,
+            Err(_) => 0,
+        };
+        println!("USDC balance: {} USDC", usdc_balance as f64 / 1_000_000.0);
+
+        // Get and display CHEESE balance
+        let cheese_balance = match executor.get_token_balance(&CHEESE_MINT.parse()?).await {
+            Ok(balance) => balance,
+            Err(_) => 0,
+        };
+        println!(
+            "CHEESE balance: {} CHEESE",
+            cheese_balance as f64 / 1_000_000.0
+        );
+        println!("=====================\n");
+
+        Some(executor)
     } else {
         None
     };
@@ -200,7 +227,7 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
     };
 
     // Print table header
-    println!("\n| Source   | Other Mint                                   | Other Name | Pool Type  | CHEESE Qty | Other Qty | Liquidity($) | Volume($) |   Fee | CHEESE Price | Pool Address                                 |");
+    println!("\n| Source   | Other Mint                                   | Other Name | Version    | CHEESE Qty | Other Qty | Liquidity($) | Volume($) |   Fee | CHEESE Price | Pool Address                                 |");
     println!("|----------|----------------------------------------------|------------|------------|------------|-----------|--------------|-----------|-------|--------------|----------------------------------------------|");
 
     // Prepare display pools
@@ -216,6 +243,12 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
         };
 
         let other_mint = pool.pool_token_mints[other_ix].clone();
+
+        // Skip blacklisted tokens
+        if is_blacklisted(&other_mint) {
+            continue;
+        }
+
         let other_symbol = mint_to_symbol
             .get(&other_mint)
             .cloned()
@@ -232,14 +265,14 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
         display_pools.push(DisplayPool {
             source: "Meteora".to_string(),
-            other_mint,
-            other_symbol,
+            other_mint: other_mint.to_string(),
+            other_symbol: other_symbol.to_string(),
             cheese_qty: format!("{:.2}", cheese_qty),
             other_qty: format!("{:.2}", other_qty),
-            pool_type: pool.pool_type.clone(),
+            pool_version: pool.pool_version.to_string(),
             tvl: format!("{:.2}", pool.pool_tvl),
             volume_usd: format!("{:.2}", pool.daily_volume),
-            fee: format!("{}%", pool.total_fee_pct.trim_end_matches('%')),
+            fee: format!("{:.2}%", pool.total_fee_pct.trim_end_matches('%')),
             pool_address: pool.pool_address.clone(),
             cheese_price: format!("${:.6}", cheese_usdc_price),
         });
@@ -276,7 +309,7 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             other_symbol,
             cheese_qty: format!("{:.2}", cheese_qty),
             other_qty: format!("{:.2}", other_qty),
-            pool_type: pool.r#type.clone(),
+            pool_version: pool.r#type.clone(),
             tvl: format!("{:.2}", pool.tvl),
             volume_usd: format!("{:.2}", pool.day.volume),
             fee: format!("{:.2}%", pool.feeRate * 100.0),
@@ -322,7 +355,7 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             pool.source,
             pool.other_mint,
             pool.other_symbol,
-            pool.pool_type,
+            pool.pool_version,
             pool.cheese_qty,
             pool.other_qty,
             format!("{:.2}", tvl),
@@ -364,12 +397,7 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             .iter()
             .find(|p| p.pool_address == opp.pool_address)
             .unwrap();
-        let fee_percent = pool
-            .total_fee_pct
-            .trim_end_matches('%')
-            .parse::<f64>()
-            .unwrap()
-            / 100.0;
+        let fee_percent = pool.total_fee_pct.trim_end_matches('%').parse::<f64>()? / 100.0;
 
         println!("\nPool: {} ({})", opp.pool_address, opp.symbol);
         println!("├─ Implied CHEESE price: ${:.10}", opp.implied_price);
@@ -414,7 +442,15 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
         // Execute trade if in hot mode
         if let Some(executor) = executor {
-            println!("\nExecuting trade...");
+            println!("\n=== Starting Trade Execution ===");
+            println!("Trade details:");
+            println!("- Is sell: {}", opp.is_sell);
+            println!("- Max trade size: {}", opp.max_trade_size);
+            println!("- USDC price: {}", opp.usdc_price);
+            println!("- Implied price: {}", opp.implied_price);
+            println!("- Net profit USD: {}", opp.net_profit_usd);
+            println!("- Pool address: {}", opp.pool_address);
+            println!("- Symbol: {}", opp.symbol);
 
             // Get the other token's index
             let (_, other_ix) = if pool.pool_token_mints[0] == CHEESE_MINT {
@@ -422,12 +458,26 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
             } else {
                 (1, 0)
             };
+            println!("\nPool details:");
+            println!("- Pool token mints: {:?}", pool.pool_token_mints);
+            println!("- Pool token amounts: {:?}", pool.pool_token_amounts);
+            println!("- Other token index: {}", other_ix);
+
+            // Ensure all necessary token accounts exist before trading
+            println!("\nEnsuring token accounts exist...");
+            executor.ensure_token_account(USDC_MINT).await?;
+            executor.ensure_token_account(CHEESE_MINT).await?;
+            executor
+                .ensure_token_account(&pool.pool_token_mints[other_ix])
+                .await?;
 
             if opp.is_sell {
-                // Path: USDC -> CHEESE -> Target -> CHEESE -> USDC
+                println!("\nExecuting sell path: USDC -> CHEESE -> Target -> CHEESE -> USDC");
 
                 // 1. USDC -> CHEESE on Meteora
-                let amount_in_usdc = (opp.max_trade_size * opp.usdc_price * 1_000_000.0) as u64;
+                let amount_in_usdc = ((opp.max_trade_size * opp.usdc_price) as u64) * 1_000_000; // Convert to USDC lamports (6 decimals)
+                println!("\nStep 1: USDC -> CHEESE");
+                println!("Amount in USDC: {}", amount_in_usdc as f64 / 1_000_000.0); // Display in human-readable USDC
                 let sig1 = executor
                     .execute_trade(
                         usdc_pool,
@@ -441,6 +491,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 2. CHEESE -> Target token
                 let amount_in_cheese = (opp.max_trade_size * 1_000_000_000.0) as u64;
+                println!("\nStep 2: CHEESE -> {}", opp.symbol);
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig2 = executor
                     .execute_trade(
                         pool,
@@ -454,6 +506,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 3. Target -> CHEESE
                 let amount_in_target = (opp.other_qty * 0.1 * 1_000_000_000.0) as u64; // 10% of target token liquidity
+                println!("\nStep 3: {} -> CHEESE", opp.symbol);
+                println!("Amount in {}: {}", opp.symbol, amount_in_target);
                 let sig3 = executor
                     .execute_trade(
                         pool,
@@ -466,15 +520,19 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
                 println!("3. {} -> CHEESE: {}", opp.symbol, sig3);
 
                 // 4. CHEESE -> USDC
+                println!("\nStep 4: CHEESE -> USDC");
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig4 = executor
                     .execute_trade(usdc_pool, CHEESE_MINT, USDC_MINT, amount_in_cheese, 50)
                     .await?;
                 println!("4. CHEESE -> USDC: {}", sig4);
             } else {
-                // Path: USDC -> CHEESE -> Target -> CHEESE -> USDC
+                println!("\nExecuting buy path: USDC -> CHEESE -> Target -> CHEESE -> USDC");
 
                 // 1. USDC -> CHEESE on Meteora
                 let amount_in_usdc = (opp.max_trade_size * opp.usdc_price * 1_000_000.0) as u64;
+                println!("\nStep 1: USDC -> CHEESE");
+                println!("Amount in USDC: {}", amount_in_usdc);
                 let sig1 = executor
                     .execute_trade(usdc_pool, USDC_MINT, CHEESE_MINT, amount_in_usdc, 50)
                     .await?;
@@ -482,6 +540,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 2. CHEESE -> Target token
                 let amount_in_cheese = (opp.max_trade_size * 1_000_000_000.0) as u64;
+                println!("\nStep 2: CHEESE -> {}", opp.symbol);
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig2 = executor
                     .execute_trade(
                         pool,
@@ -495,6 +555,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 
                 // 3. Target -> CHEESE
                 let amount_in_target = (opp.other_qty * 0.1 * 1_000_000_000.0) as u64; // 10% of target token liquidity
+                println!("\nStep 3: {} -> CHEESE", opp.symbol);
+                println!("Amount in {}: {}", opp.symbol, amount_in_target);
                 let sig3 = executor
                     .execute_trade(
                         pool,
@@ -507,6 +569,8 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
                 println!("3. {} -> CHEESE: {}", opp.symbol, sig3);
 
                 // 4. CHEESE -> USDC
+                println!("\nStep 4: CHEESE -> USDC");
+                println!("Amount in CHEESE: {}", amount_in_cheese);
                 let sig4 = executor
                     .execute_trade(usdc_pool, CHEESE_MINT, USDC_MINT, amount_in_cheese, 50)
                     .await?;
@@ -519,37 +583,56 @@ async fn run_iteration(executor: &Option<TradeExecutor>) -> Result<()> {
 }
 
 fn find_arbitrage_opportunities(
-    pools: &[MeteoraPool],
+    meteora_pools: &[MeteoraPool],
     cheese_usdc_price: f64,
 ) -> Result<Vec<ArbitrageOpportunity>> {
     let mut opportunities = Vec::new();
 
-    for pool in pools {
-        // Skip USDC pool and pools with derived prices
-        if pool.pool_address == "2rkTh46zo8wUvPJvACPTJ16RNUHEM9EZ1nLYkUxZEHkw" || pool.derived {
-            continue;
-        }
-
+    for pool in meteora_pools {
         let (cheese_ix, other_ix) = if pool.pool_token_mints[0] == CHEESE_MINT {
             (0, 1)
         } else {
             (1, 0)
         };
 
+        let other_mint = &pool.pool_token_mints[other_ix];
+
+        // Skip blacklisted tokens
+        if is_blacklisted(other_mint) {
+            continue;
+        }
+
         let cheese_qty: f64 = pool.pool_token_amounts[cheese_ix].parse()?;
         let other_qty: f64 = pool.pool_token_amounts[other_ix].parse()?;
-        let fee_percent: f64 = pool.total_fee_pct.trim_end_matches('%').parse::<f64>()? / 100.0;
+
+        // If this is USDC, use price of 1.0
+        let other_price = if other_mint == USDC_MINT {
+            1.0 // USDC is always worth $1
+        } else {
+            cheese_usdc_price
+        };
+
+        let implied_price = (other_qty * other_price) / cheese_qty;
+        let price_diff_pct = ((implied_price - cheese_usdc_price) / cheese_usdc_price) * 100.0;
+
+        let fee_percent = pool.total_fee_pct.trim_end_matches('%').parse::<f64>()? / 100.0;
 
         if cheese_qty <= 0.0 || other_qty <= 0.0 {
             continue;
         }
 
-        let implied_price = (other_qty * cheese_usdc_price) / cheese_qty;
-        let price_diff_pct = ((implied_price - cheese_usdc_price) / cheese_usdc_price) * 100.0;
-
         // If price difference is significant (>1%)
         if price_diff_pct.abs() > 1.0 {
-            let max_trade_size = cheese_qty * 0.1; // 10% of pool liquidity
+            // Calculate max trade size based on pool liquidity
+            let pool_based_size = if pool.pool_token_mints.contains(&USDC_MINT.to_string()) {
+                cheese_qty * 0.1
+            } else {
+                cheese_qty * 0.05
+            };
+
+            // Limit by MAX_USDC_INPUT
+            let max_trade_size = (MAX_USDC_INPUT / cheese_usdc_price).min(pool_based_size);
+
             let price_diff_per_cheese = (implied_price - cheese_usdc_price).abs();
             let gross_profit = max_trade_size * price_diff_per_cheese;
 
